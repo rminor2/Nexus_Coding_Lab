@@ -1,0 +1,137 @@
+Design Assessment Report 4 - Architectural Design Defense
+
+Ryan Minor | CS4320 | November 14, 2026
+
+Decision: keep confidential deactivation auditing separate from public events, with file-backed history behind an audit interface.
+
+1. Context and requirements
+
+The bounded operation is CustomerLifecycleService.deactivate. In the supplied Nexus2 implementation, it saved an inactive customer and published customer.deactivated with the customer email and trimmed reason. CustomerNotificationSubscriber.handle copied the reason into the customer message. The November 10 teaching contract introduced a new confidentiality requirement; the original implementation was not previously subject to that policy. The problem is controlling this information flow while preserving the operation's existing authorization and failure behavior [1].
+
+Three requirement groups govern the decision. First, preserve command behavior: admin and manager are allowed, viewer is denied, a missing customer raises CustomerNotFoundError, and reason.strip() must contain at least five characters. Rejected commands must not change customer state, publish, notify, or append a successful-deactivation audit record. Success returns the customer with active=False [1, R1-R2].
+
+Second, keep the customer identity and email in the public event but omit the confidential reason under every field name. Send exactly "Your Atlas account has been deactivated." to the existing destination. Record exactly one internal entry per accepted invocation with customer_id, actor_id, and trimmed reason. The audit must exist before a notification exception propagates; the customer must remain inactive [1, R2-R5].
+
+Third, November 12 adds clean close-and-reopen persistence: append history to a local file, allow a fresh store to read it, and preserve earlier entries when a second entry is added. The stipulated scope is one writer and successful file I/O, not a database or crash-proof durability [2, slides 2-4].
+
+Known facts are the inspected implementation at merged team commit 8f2fdae and the actual verification described below [3]. Successful audit writes and a usable parent directory are assumptions of this lab, not demonstrated production guarantees. Audit-write failure, concurrency, crash recovery, and encryption are outside this implementation. Existing notification failure propagation remains in scope.
+
+The recommendation is to retain the separate audit collaborator and use FileAuditStore for the lab. The repository still keeps InMemoryAuditStore for original regression fixtures. This report evaluates the implemented change rather than presenting file persistence as a future capability.
+
+
+--- PAGE BREAK ---
+
+
+2. Proposed design and operation
+
+Starting arrangement: lifecycle service -> public EventBus containing reason -> customer notification containing reason. Implemented arrangement: lifecycle service -> internal AuditStore; then lifecycle service -> sanitized EventBus -> generic notification. Confidential information is removed at the publication boundary, not merely hidden by one subscriber [3, services.py; notifications.py].
+
+Responsibility ownership is explicit. AuthorizationService decides management permission. The repository looks up and saves customers. CustomerLifecycleService validates and orders the operation. AuditStore defines the write collaboration. FileAuditStore owns JSON Lines encoding, append access, and history reading. EventBus dispatches synchronously; the notification subscriber owns the customer-facing message. The lab adapter constructs these collaborators and supplies the file path. It converts real stored records to mappings rather than fabricating evidence [3].
+
+The write interface is AuditStore.record_deactivation(customer_id: str, actor_id: str, reason: str) -> None, called by the lifecycle service. Actor.user_id becomes the record's actor_id. The lifecycle invokes it only after authorization, lookup, and validation. The file implementation opens in append mode with UTF-8, writes one JSON object plus a newline, and closes the handle. Successful I/O is assumed; failures are not translated or rolled back. The protocol abstracts writing only, not the read operation [3, services.py; audit.py].
+
+The inspection interface is FileAuditStore(path).records -> list of DeactivationAuditRecord. Each read opens the configured file and parses the stored lines. A missing file yields an empty list. Other I/O failures or invalid JSON propagate. This property is not a public, access-controlled audit API. Supplying a path does not authorize a reader; operating-system permissions govern access.
+
+Ordinary operation trace:
+
+1. A manager actor invokes deactivate for an existing active customer with a reason such as "  Duplicate account  ". AuthorizationService accepts the role.
+
+2. The repository supplies the customer. The service trims the reason to "Duplicate account" and checks its length before performing any write.
+
+3. The service sets active=False and saves the customer in the repository.
+
+4. The service calls record_deactivation with the customer ID, actor.user_id, and trimmed reason. FileAuditStore appends and closes the file.
+
+5. The service publishes customer.deactivated with customer_id and an email-only payload. The reason never enters this public event.
+
+6. The subscriber sends the exact generic message to that email. With successful delivery, deactivate returns the inactive customer. A fresh store on the same path can read the retained audit entry.
+
+Implemented changes include the service ordering, notification text, audit protocol, file store, adapter wiring, and tests. No retry mechanism, encryption layer, customer-database persistence, or crash-atomic transaction is implemented. An independent-process persistence check remains proposed, not executed in this report.
+
+
+--- PAGE BREAK ---
+
+
+3. Two credible alternatives
+
+Alternative A: lifecycle-owned file auditing. The lifecycle service could accept a file path, append the same JSON entries itself after saving the customer, and expose an internal history-reading method. It could satisfy the same confidentiality, ordering, and clean-reopen requirements without an injected audit object. Its advantage is fewer classes and less constructor wiring in a very small program. I prefer the collaborator because lifecycle policy would otherwise also own encoding and filesystem access. Changing storage or testing persistence would require understanding a component that also changes customer state and publishes events. The cost of my choice is another interface and construction step.
+
+Alternative B: a separate private synchronous audit channel. The service could send the customer ID, actor ID, and reason through a distinct internal dispatcher whose file-writing handler completes before the sanitized public publication. This can satisfy the requirements if exactly one audit handler is invoked once and completes successfully before the public bus runs. Its advantage is separating the service from the identity of the audit writer and supporting additional internal observers later. I prefer a direct collaborator here because one required audit operation does not justify a second dispatcher, subscription setup, and ordering rules. The unchanged public bus cannot substitute for this private channel: placing the reason on that broadcast would violate the information-flow requirement.
+
+Both alternatives must use persistent storage for the Thursday extension. A service-owned in-memory list alone is not an equivalent solution to the revised contract. Pattern names are not the basis of the choice; the comparison concerns ownership, observable completion, and setup cost under the same rules.
+
+4. Consequences and two checks
+
+Tradeoff one - explicit audit ownership. A narrow write protocol lets lifecycle policy use either store without file-format knowledge. The benefit is replaceable storage and focused verification; the accepted cost is dependency wiring and a separate module. The actual protocol does not standardize history reading, so adapter-side inspection still depends on a concrete store interface.
+
+Tradeoff two - append before public publication. Waiting for the audit append means notification failure does not prevent a record from being retained. The accepted cost is synchronous file I/O and a partial-completion boundary: customer state is already saved before auditing and notification. An audit-write failure could leave an inactive customer without a new audit entry; a notification failure leaves the audit but raises to the caller. The lab assumes successful audit writes, so this is not claimed as an atomic operation.
+
+Ordinary check, executed: test_03_reason_is_retained_in_internal_audit starts with one active customer and a temporary file path. It deactivates as manager with a padded synthetic reason and compares the real records with one exact customer/actor/trimmed-reason mapping. Together with test_01, test_02, and test_04, the contract suite checks the sanitized event, generic message, and inactive returned customer. These observations support the normal information flow, not real email delivery or persistent customer storage.
+
+Failure check, executed: test_08_notification_failure_does_not_erase_audit replaces the simulated sender with one raising RuntimeError. Deactivation must raise, the customer must remain inactive, the audit must contain the expected entry, and the published event must omit the secret. It passed. This establishes the specified ordering for that exception; it does not establish recovery or safe retries.
+
+
+--- PAGE BREAK ---
+
+
+4. Consequences and two checks - continued
+
+Additional student checks: test_09 accepts "  abcde  ", verifies the trimmed audit entry, and checks an email-only payload. test_10 writes a synthetic record through FileAuditStore, reads it using a new instance on the same path, appends a second record, and verifies both using a third instance. Test_10 demonstrates file readback and append preservation across fresh objects; all objects still run in one Python process. Each contract test receives its own TemporaryDirectory, preventing shared-path contamination [3, lab/test_contract.py].
+
+Actual November 14 verification used an isolated archive of merged commit 8f2fdae and Python 3.12.1. From nexus2, python3 -B run_lab.py reported "Ran 10 tests" and "OK"; python3 -B -m pytest tests reported "23 passed in 0.03s". Both exited 0. Appendix A gives code excerpts and evidence locations. The original pytest fixtures use the in-memory store, so those 23 passes alone do not verify the file backend. The separate contract run does.
+
+5. Response to review
+
+Omar Hassan's Security Architecture Review asks whether trust boundaries are clear and whether modules receive information they do not need [4, "Trust Is an Architectural Decision" and "Least Privilege Applies to Architecture"]. My response is to remove the reason from the public event itself. Restricting the notification template alone would leave other public subscribers able to observe it. The sanitized payload and test_01 support this boundary. File storage remains trusted internal infrastructure, but the implementation provides no encryption or application-level reader authorization. The reviewer's questions frame this concern; they are not evidence of a separate exploit.
+
+Carlos Rivera's Testability Architecture Review emphasizes independently verifiable responsibilities and observable behavior [5, "Isolation Improves Understanding" and "Visibility Matters"]. My response is a replaceable audit writer and an inspectable record representation. The adapter reads actual records, and test_10 reconstructs a reader rather than copying the first object's list. That makes persistence observable independently of notification delivery.
+
+These concerns reinforce deliberate boundaries but introduce a tension: verification needs access to confidential records, while least privilege limits who should read them. The lab resolves this narrowly with synthetic reasons, temporary files, and internal inspection rather than publishing audit details. The remaining cost is that any local process with file read permission can inspect plaintext reasons. Testability is not permission enforcement.
+
+6. Handoff and reconsideration
+
+My recommendation is retain the collaborator and proceed with the file-backed prototype within its stated scope. The most important verification gap is whether history is recovered by an independent process after normal exit. The first next step is a proposed two-process check: process one deactivates a synthetic customer through the service and exits; process two constructs FileAuditStore at the same temporary path and must read exactly the expected ID, actor, and trimmed reason. This tests process-to-process persistence, not crash durability.
+
+If multiple writers, crash-atomic updates, or enforced audit access become requirements, a transaction-capable storage design with controlled access would become preferable to this JSON Lines file. File loss, malformed records, retention, and audit-write failure need decisions before production use. I would revise rather than stretch the current passing tests into those guarantees.
+
+
+--- PAGE BREAK ---
+
+
+Appendix A. Inspectable implementation, output, and sources
+
+Shared work: Ryan Minor and Jacob Yepez collaborated on the Nexus lab. Jacob supplied the initial audit component and the later persistence extension. Codex assisted with integration, testing, evidence organization, and preparing this report. Technical judgments in this report are presented for Ryan's review. The source snapshot is merged commit 8f2fdae; PR #1 was merged November 12. Code excerpts below are from that snapshot.
+
+src/northstar/services.py - deactivation ordering (excerpt):
+
+customer.active = False
+
+self._repository.save(customer)
+
+self._audit.record_deactivation(customer.customer_id, actor.user_id, clean_reason)
+
+self._events.publish(DomainEvent(event_type="customer.deactivated", customer_id=customer.customer_id, payload={"email": customer.email}))
+
+src/northstar/audit.py - FileAuditStore write (excerpt):
+
+record = DeactivationAuditRecord(customer_id, actor_id, reason.strip())
+
+with open(self._path, "a", encoding="utf-8") as handle:
+
+    handle.write(json.dumps(asdict(record)) + "\n")
+
+Observed output, November 14: python3 -B run_lab.py: Ran 10 tests in 0.005s; OK; exit 0. python3 -B -m pytest tests: 23 passed in 0.03s; exit 0. Full fresh-run logs are saved with this report in output/da4/verified-contract.txt and verified-regression.txt. The repository evidence.md also retains baseline, earlier runs, and Jacob's persistence update. Proposed two-process checks are not included among these observed results.
+
+Sources (numbers correspond to citations in the report):
+
+[1] Nexus coding lab README: R1-R5, scope, and authorized test update: https://github.com/presidentjacob/Nexus_Coding_Lab/blob/8f2fdae/README.md
+
+[2] November_12_Nexus_CODING.pdf, slides 2-6 and 8-9. Supplied Canvas export: Software Design - 2026Fa CS 4320 002, downloaded November 12. Requirements concern append-only file history, fresh instances, scope, and saving evidence.
+
+[3] Fixed team source snapshot: services.py, audit.py, notifications.py, lab/adapter.py, lab/test_contract.py, tests/conftest.py and evidence.md: https://github.com/presidentjacob/Nexus_Coding_Lab/tree/8f2fdae/nexus2
+
+Team evidence and recorded persistence update: https://github.com/presidentjacob/Nexus_Coding_Lab/blob/8f2fdae/evidence.md
+
+[4] Omar Hassan, Security Architecture Review, ARP-004A-O: https://docs.google.com/document/d/e/2PACX-1vTo-ZmE1omkU_02DIUOBkUtudujHltfhy_JkFcKgdfK7Go8gXESSoMdYyF46sym6XFuIiLEW4h6yXDT/pub
+
+[5] Carlos Rivera, Testability Architecture Review, ARP-004B-C: https://docs.google.com/document/d/e/2PACX-1vR_1zb7Y_fGFOAyU5uXqorjarvRP99FSDcMWX3rAF4iroCMzCZrql7ebjkpbfOT1yVETojDlmuX_Ou3/pub
