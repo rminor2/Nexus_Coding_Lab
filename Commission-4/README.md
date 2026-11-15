@@ -25,6 +25,6 @@ Verification used an isolated snapshot of team commit 8f2fdae with Python 3.12.1
 
 ## Attribution and submission
 
-Ryan Minor and Jacob Yepez collaborated on the lab. Jacob supplied the initial audit component and later persistence extension; Codex assisted with integration, verification, evidence organization, and report preparation. Team source: [presidentjacob/Nexus_Coding_Lab](https://github.com/presidentjacob/Nexus_Coding_Lab), [merged PR #1](https://github.com/presidentjacob/Nexus_Coding_Lab/pull/1).
+Ryan Minor and Jacob Yepez collaborated on the lab. Jacob supplied the initial audit component and later persistence extension; Team source: [presidentjacob/Nexus_Coding_Lab](https://github.com/presidentjacob/Nexus_Coding_Lab), [merged PR #1](https://github.com/presidentjacob/Nexus_Coding_Lab/pull/1).
 
 This folder provides the individual report and inspectable implementation/evidence link. It does not claim that PR4 or the portfolio Google Doc was submitted. Submit the report PDF in the existing Canvas DA4 assignment as directed; the portfolio remains in the existing Google Doc.
